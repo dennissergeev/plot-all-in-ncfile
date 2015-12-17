@@ -1,5 +1,6 @@
-from __future__ import print_function, division
+from __future__ import print_function, division, absolute_import
 import argparse
+import cartopy.crs as ccrs
 import cf_units
 import datetime
 import glob
@@ -10,10 +11,10 @@ import matplotlib.cm as mcm
 import numpy as np
 import os
 import sys
-#
-#import phys_meteo as met
-#import um_utils as umu
-#import var_utils as var
+
+import plot_util
+
+import um_utils as umu
 
 DESCR = """
 Plot snapshots from subsets of variables from a UM output.
@@ -27,108 +28,79 @@ parser.add_argument("-v", "--variables", nargs="*",
                     help="Variables to plot; if not supplied,\n"
                          "will plot the first variable in file")
 
+parser.add_argument("-lev", "--level", default=0, type=float,
+                    help="Level to plot\n"
+                         "(if the variable has a vertical dimension)")
+
+parser.add_argument("-levname", "--level_name", type=str,
+                    help="Pressure level to plot\n"
+                         "(if the variable's vertical dimension is pressure)")
+
 parser.add_argument("-p", "--pr2f", type=str,
                     help="Print to file; if not supplied,\n"
                          "show on display")
 
+parser.add_argument("--unrotatewind", default=True, type=bool,
+                    help="If the file contains u- and v-winds\n"
+                         "on a rotated pole coordinate system,\n"
+                         "rotate them to a 'normal' coordinate system")
+
+parser.add_argument("--use_interface", default='iris', type=str,
+                    help="Interface to use (only iris is operational)")
+
 if __name__ == '__main__':
     args = parser.parse_args()
-    use = 'iris'
+    use = args.use_interface
 
-    print(args.input_file)
-    print(args.variables)
+    #print(args)
 
     # Read the given data file
     fn_in = args.input_file
     try:
         ds = iris.load(fn_in)
-    except RuntimeError:
+    except IOError:
         print('Could not open file {}'.format(fn_in))
         sys.exit(1)
+
+    umu.replace_unknown_names(ds, use=use)
 
     print('File contains:')
     print(ds)
 
-    if not args.variables:
-        qplt.contourf(ds[0][0,0,...])
-    plt.show()
+    if args.unrotatewind:
+        umu.unrotate_wind(ds, replace=True)
 
-    #flist = sorted(glob.glob(sys.argv[1]))
-    #plid = sys.argv[2]
+    if args.variables:
+        varnames = args.variables
+    else:
+        varnames = [ds[0].name()]
 
-    #try:
-    #    jlev = float(sys.argv[3])
-    #except:
-    #    jlev = 950.
+    print(ds)
+    for ivarname in varnames:
+        print('Plotting {}...'.format(ivarname))
+        icube = umu.get_cube(ds, ivarname)
 
-    lon0 = 11
-    lat0 = 75
-    mapkw = dict(lon1=lon0-16,lon2=lon0+40,lat1=lat0-9,lat2=lat0+7,tick_incr=[5.,1.],resolution='i',fill=True)
-    cmap = 'viridis'
-    cbkw = dict(orientation='vertical', shrink=1)
-
-    flist = []
-
-    for ifile in flist:
-        print(ifile)
-        f = iris.load(ifile)
-        umu.replace_unknown_names(f, use='iris')
-        umu.unrotate_wind(f, replace=True)
-
-        u_cube = umu.get_cube(f, 'transformed_x_wind')
-        v_cube = umu.get_cube(f, 'transformed_y_wind')
-        w_cube = umu.get_cube(f, 'tendency') # CHECK!!!!!!!!!!!!!!!!!!
-        pv_cube = umu.get_cube(f, 'potential vorticity')
-        zg_cube = umu.get_cube(f, 'geopotential_height')
-        lon2d, lat2d = [i.points for i in u_cube.aux_coords[-2:]]
-
-        tcoord = f[0].coord('time')
-        fcst_dt = cf_units.num2date(tcoord.points, tcoord.units.name, tcoord.units.calendar)
-        for n, it in enumerate(tcoord):
-            idt = fcst_dt[n]
-            print(idt)
-
-            dims = 'zyx'
-            if len(tcoord.points) > 1:
-                u = u_cube[n, ...]
-                v = v_cube[n, ...]
-                w = w_cube[n, ...]
-                pv = pv_cube[n, ...]
-                zg = zg_cube[n, ...]
+        zcoord = None
+        if len(icube.coords(axis='z')) > 0:
+            if args.level_name:
+                for icoord in icube.coords(axis='z'):
+                    if args.level_name.lower() in icoord.name().lower():
+                        zcoord = icoord
+                if zcoord is None:
+                    raise ValueError('no z-coord matches {}'.format(args.level_name))
             else:
-                u = u_cube  
-                v = v_cube  
-                w = w_cube  
-                zg = zg_cube
-                pv = pv_cube
-    
-            mcoords = umu.get_model_real_coords(w, dims=dims)
-            plev = mcoords[dims.find('z')].points
-            ilev = np.argmin(abs(plev[:] - jlev))    
-            #
-            # Additional diagnostics of wind
-            #
-            uwind, info3d = tools.prep_data(u.data, dims)
-            vwind, _ = tools.prep_data(v.data, dims)
-            W2D = standard.WindHorizontal(uwind, vwind, um_res_m, um_res_m)
-            vo = W2D.vort_z()
-            vo = tools.recover_data(vo, info3d)
-    
-            #
-            # Plotting
-            #
-            fig, ax = plt.subplots()
-            bm = mymap.make_map(ax=ax, **mapkw)
-            xx, yy = bm(lon2d, lat2d)
-            
-            if plid == 'pv':
-                c1 = bm.contourf(xx, yy, pv.data[ilev,:,:]*1e6, np.arange(-5,5.5,0.5), cmap=plt.cm.BrBG_r, extend='both')
-                c1.cmap.set_under('k')
-                c1.cmap.set_over('r')
-                cb1 = plt.colorbar(c1, ax=ax)
-                cb1.ax.text(0.5, -0.05, r'${0}$'.format('PV units'), va='top', ha='center',size=pp.fntsz_c)
-                ax.set_title('Potential vorticity ($x10^6$) at {}hPa'.format(jlev)+\
-                             '\n'+idt.strftime('%b-%d %H:%M'),size=pp.fntsz_t)
-                
-                subsubdir = 'um_pv'
-                imgname = 'um_pv_{0}hpa_'.format(jlev) + idt.strftime('%y%m%d-%H%M')
+                zcoord = icube.coords(axis='z')[0]
+            ilev = np.argmin(abs(args.level - zcoord.points))
+        plot_data = icube[ilev,...]
+        # Plot this timeslice
+        fig = plt.figure()
+        ax = None
+        #ax = fig.add_subplot(111, projection=ccrs.PlateCarree())
+        var_kwargs = dict()
+        ax, plot = plot_util.geo_plot(plot_data, ax=ax, **var_kwargs)
+        cb = plot_util.add_colorbar(plot, ax=ax, orientation='vertical')
+        plot_util.label_ax(ax, cb, icube)
+
+        #tcoord = cube.coord('time')
+        #um_dt = cf_units.num2date(tcoord.points, tcoord.units.name, tcoord.units.calendar)
+    plt.show()

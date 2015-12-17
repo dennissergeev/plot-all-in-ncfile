@@ -2,29 +2,76 @@
 Plotting utility functions.
 
 """
-
+import cartopy
 import cartopy.crs as ccrs
 from cartopy.util import add_cyclic_point
 from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
-
+import iris
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-
 import numpy as np
-
-import xray
-from xray.plot.utils import _determine_cmap_params
 
 import warnings
 
-# Some default plotting arguments; not really used in this script
-# but taken from my plotting toolkit along with geo_plot and
-# add_colorbar.
 _PLOTTYPE_ARGS = {
     'pcolormesh': dict(linewidth='0'),
     'pcolor': dict(linewidth='0'),
     'contourf': dict(),
 }
+
+def _determine_cmap_params(plot_data, vmin=None, vmax=None, cmap=None,
+                           center=None, robust=False, extend=None,
+                           cnorm=None):
+    """
+    Use some heuristics to set good defaults for colorbar and range.
+
+    Adapted from xray.
+    https://github.com/xray/xray/blob/master/xray/plot/utils.py
+
+    Parameters
+    ----------
+    plot_data: Numpy array
+
+    Returns
+    -------
+    cmap_params : dict
+    """
+    calc_data = plot_data.copy()
+    if vmin is None:
+        vmin = np.nanmin(calc_data)
+
+    if vmax is None:
+        vmax = np.nanmax(calc_data)
+
+    # Simple heuristics for whether these data should  have a divergent map
+    divergent = ((vmin < 0) and (vmax > 0)) or center is not None
+
+    # Now set center to 0 so math below makes sense
+    if center is None:
+        center = 0
+
+    # A divergent map should be symmetric around the center value
+    if divergent:
+        vlim = max(abs(vmin - center), abs(vmax - center))
+        vmin, vmax = -vlim, vlim
+
+    # Now add in the centering value and set the limits
+    vmin += center
+    vmax += center
+
+    # Choose default colormaps if not provided
+    if cmap is None:
+        if divergent:
+            cmap = "RdBu_r"
+        else:
+            cmap = "viridis"
+
+    # Allow viridis before matplotlib 1.5
+    if mpl.__version__ < 1.5:
+        cmap == "Spectral"
+
+    return dict(vmin=vmin, vmax=vmax, cmap=cmap)
 
 
 def add_colorbar(mappable, fig=None, ax=None, thickness=0.025,
@@ -87,78 +134,56 @@ def add_colorbar(mappable, fig=None, ax=None, thickness=0.025,
 
     return cb
 
+def label_ax(ax, cb, cube):
+    """ Label the colorbar with the best info available """
+    title = cube.name()
+    ax.set_title(title)
 
-def check_cyclic(data, coord='lon'):
-    """ Checks if a DataArray already includes a cyclic point along the
-    specified coordinate axis. If not, adds the cyclic point and returns
-    the modified DataArray.
+    cb_label = '{}'.format(cube.units)
+    cb.set_label(cb_label)
 
-    """
-    return np.all(data.isel(**{coord: 0}) == data.isel(**{coord: -1}))
-
-
-def cyclic_dataarray(da, coord='lon'):
-    """ Add a cyclic coordinate point to a DataArray along a specified
-    named coordinate dimension.
-
-    >>> from xray import DataArray
-    >>> data = DataArray([[1, 2, 3], [4, 5, 6]],
-    ...                      coords={'x': [1, 2], 'y': range(3)},
-    ...                      dims=['x', 'y'])
-    >>> cd = cyclic_dataarray(data, 'y')
-    >>> print cd.data
-    array([[1, 2, 3, 1],
-           [4, 5, 6, 4]])
-    """
-    assert isinstance(da, xray.DataArray)
-
-    lon_idx = da.dims.index(coord)
-    cyclic_data, cyclic_coord = add_cyclic_point(da.values,
-                                                 coord=da.coords[coord],
-                                                 axis=lon_idx)
-
-    # Copy and add the cyclic coordinate and data
-    new_coords = dict(da.coords)
-    new_coords[coord] = cyclic_coord
-    new_values = cyclic_data
-
-    new_da = xray.DataArray(new_values, dims=da.dims, coords=new_coords)
-
-    # Copy the attributes for the re-constructed data and coords
-    for att, val in da.attrs.items():
-        new_da.attrs[att] = val
-    for c in da.coords:
-        for att in da.coords[c].attrs:
-            new_da.coords[c].attrs[att] = da.coords[c].attrs[att]
-
-    return new_da
-
-
-def geo_plot(darray, ax=None, method='contourf',
-             projection='PlateCarree', grid=False, **kwargs):
+def geo_plot(cube, ax=None, method='contourf',
+             projection='PlateCarree', **kwargs):
     """ Create a global plot of a given variable.
 
     Parameters:
     -----------
-    darray : xray.DataArray
-        The darray to be plotted.
+    cube : iris.cube.Cube
+        The cube to be plotted.
     ax : axis
-        An existing axis instance, else one will be created.
+        An existing matplotlib axis instance, else one will be created.
     method : str
-        String to use for looking up name of plotting function via iris
+        String to use for looking up name of plotting function
     projection : str or tuple
         Name of the cartopy projection to use and any args
         necessary for initializing it passed as a dictionary;
         see func:`make_geoaxes` for more information
-    grid : bool
-        Include lat-lon grid overlay
     **kwargs : dict
         Any additional keyword arguments to pass to the plotter,
         including colormap params. If 'vmin' is not in this
         set of optional keyword arguments, the plot colormap will be
         automatically inferred.
-
     """
+
+    # Extract longitude and latitude
+    xcoord = cube.coords(axis='x')[0:1]
+    ycoord = cube.coords(axis='y')[0:1]
+
+    for ixc, iyc in zip(xcoord, ycoord):
+        if  'rotated' in ixc.coord_system.grid_mapping_name.lower() \
+        and 'rotated' in iyc.coord_system.grid_mapping_name.lower():
+
+            lon2d, lat2d = np.meshgrid(ixc.points, iyc.points)
+            nplon = ixc.coord_system.grid_north_pole_longitude
+            nplat = ixc.coord_system.grid_north_pole_latitude
+            # Unrotate coordinates
+            lon, lat = iris.analysis.cartography.unrotate_pole(lon2d, lat2d,
+                                                               nplon, nplat)
+        else:
+            lon, lat = ixc.points, iyc.points
+
+    clon = 0.5*(lon.min()+lon.max())
+    clat = 0.5*(lat.min()+lat.max())
 
     # Set up plotting function
     if method in _PLOTTYPE_ARGS:
@@ -180,6 +205,13 @@ def geo_plot(darray, ax=None, method='contourf',
     new_axis = ax is None
 
     if new_axis: # Create a new cartopy axis object for plotting
+        # When dealing with regions close to poles,
+        # use Lambert Conformal projection
+        if (lat > 45).all():
+            projection = ('LambertConformal',
+                          dict(central_longitude=clon,
+                               central_latitude=clat))
+
         if isinstance(projection, (list, tuple)):
             if len(projection) != 2:
                 raise ValueError("Expected 'projection' to only have 2 values")
@@ -195,23 +227,24 @@ def geo_plot(darray, ax=None, method='contourf',
     else: # Set current axis to one passed as argument
         if not hasattr(ax, 'projection'):
             raise ValueError("Expected `ax` to be a GeoAxes instance")
-        plt.sca(ax)
+      #  plt.sca(ax) # Why?
 
-    # Setup map
-    ax.set_global()
-    ax.coastlines()
+    # Set up map
+    ax.coastlines('110m')
+    ax.add_feature(cartopy.feature.LAND, facecolor='k', alpha=0.25)
+    #ax.add_feature(cartopy.feature.OCEAN)
 
     try:
         gl = ax.gridlines(crs=extra_args['transform'], draw_labels=True,
                           linewidth=0.5, color='grey', alpha=0.8)
-        LON_TICKS = [ -180, -90, 0, 90, 180 ]
-        LAT_TICKS = [ -90, -60, -30, 0, 30, 60, 90 ]
+        #LON_TICKS = [ -180, -90, 0, 90, 180 ]
+        #LAT_TICKS = [ -90, -60, -30, 0, 30, 60, 90 ]
         gl.xlabels_top   = False
         gl.ylabels_right = False
-        gl.xlines = grid
-        gl.ylines = grid
-        gl.xlocator = mticker.FixedLocator(LON_TICKS)
-        gl.ylocator = mticker.FixedLocator(LAT_TICKS)
+        #gl.xlines = grid
+        #gl.ylines = grid
+        #gl.xlocator = mticker.FixedLocator(LON_TICKS)
+        #gl.ylocator = mticker.FixedLocator(LAT_TICKS)
         gl.xformatter = LONGITUDE_FORMATTER
         gl.yformatter = LATITUDE_FORMATTER
     except TypeError:
@@ -219,11 +252,10 @@ def geo_plot(darray, ax=None, method='contourf',
 
     # Infer colormap settings if not provided
     if not ('vmin' in kwargs):
-        warnings.warn("Re-inferring color parameters...")
-        cmap_kws = _determine_cmap_params(darray.data)
+        #warnings.warn("Re-inferring color parameters...")
+        cmap_kws = _determine_cmap_params(cube.data)
         extra_args.update(cmap_kws)
 
-    gp = plot_func(darray.lon.values, darray.lat.values, darray.data,
-                   **extra_args)
+    gp = plot_func(lon, lat, cube.data, **extra_args)
 
     return ax, gp
